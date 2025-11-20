@@ -156,13 +156,9 @@ class CryptoManager:
             self._generate_keys()
 
     def _generate_keys(self):
-        """Neue RSA-Schlüssel generieren"""
-        logger.info("Generiere neue RSA-Schlüssel...")
-        self.private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-            backend=default_backend()
-        )
+        """Neue Ed25519-Schlüssel generieren"""
+        logger.info("Generiere neue Ed25519-Schlüssel...")
+        self.private_key = ed25519.Ed25519PrivateKey.generate()
         self.public_key = self.private_key.public_key()
 
         private_pem = self.private_key.private_bytes(
@@ -179,32 +175,17 @@ class CryptoManager:
         self.config.set_keys(private_pem, public_pem)
 
     def sign_message(self, data: bytes) -> bytes:
-        """Nachricht signieren"""
-        return self.private_key.sign(
-            data,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
+        """Nachricht mit Ed25519 signieren"""
+        return self.private_key.sign(data)
 
     def verify_signature(self, public_key_pem: str, data: bytes, signature: bytes) -> bool:
-        """Signatur verifizieren"""
+        """Ed25519 Signatur verifizieren"""
         try:
             public_key = serialization.load_pem_public_key(
                 public_key_pem.encode(),
                 backend=default_backend()
             )
-            public_key.verify(
-                signature,
-                data,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
+            public_key.verify(signature, data)
             return True
         except Exception as e:
             logger.error(f"Signaturverifikation fehlgeschlagen: {e}")
@@ -783,4 +764,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
