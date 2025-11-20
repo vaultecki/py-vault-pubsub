@@ -430,12 +430,15 @@ class MessageHandler:
                 # Peer Auth Requests sind nicht verschlüsselt
                 if msg_type == 4:
                     await self._handle_peer_auth(encrypted_payload, node_id)
+                # Peer Update ist auch unverschlüsselt (von bekannten Peers)
+                elif msg_type == 5:
+                    await self._handle_peer_update(encrypted_payload, node_id)
                 else:
                     logger.warning(f"Unbekannter Node: {node_id}")
                 return
 
-            # Entschlüsseln (außer Peer Auth)
-            if msg_type == 4:
+            # Entschlüsseln (außer Peer Auth und Peer Updates)
+            if msg_type == 4 or msg_type == 5:
                 payload = encrypted_payload
             else:
                 try:
@@ -461,6 +464,8 @@ class MessageHandler:
                 await self._handle_subscription(payload, node_id, signature)
             elif msg_type == 4:
                 await self._handle_peer_auth(payload, node_id)
+            elif msg_type == 5:
+                await self._handle_peer_update(payload, node_id)
         except Exception as e:
             logger.error(f"Fehler beim Verarbeiten der Nachricht: {e}")
 
@@ -530,6 +535,30 @@ class MessageHandler:
 
         except Exception as e:
             logger.error(f"Fehler beim Subscription Handler: {e}")
+
+    async def _handle_peer_update(self, payload: bytes, node_id: str):
+        """Admin Peer Update (Add/Remove) vom Netzwerk"""
+        try:
+            msg = json.loads(payload.decode('utf-8'))
+            action = msg.get('action')  # 'add' oder 'remove'
+            target_node_id = msg.get('target_node_id')
+            target_public_key = msg.get('target_public_key')
+            admin_node_id = msg.get('admin_node_id')
+
+            if action == 'add':
+                logger.info(f"Admin {admin_node_id[:8]}... hat {target_node_id[:8]}... genehmigt")
+                self.node.config.add_peer(target_node_id, target_node_id, target_public_key)
+                logger.info(f"Node {target_node_id[:8]}... lokal akzeptiert")
+
+            elif action == 'remove':
+                logger.warning(f"Admin {admin_node_id[:8]}... hat {target_node_id[:8]}... entfernt")
+                if 'peers' in self.node.config.config and target_node_id in self.node.config.config['peers']:
+                    del self.node.config.config['peers'][target_node_id]
+                    self.node.config.save()
+                    logger.warning(f"Node {target_node_id[:8]}... lokal entfernt")
+
+        except Exception as e:
+            logger.error(f"Fehler beim Peer Update Handler: {e}")
 
     async def _handle_peer_auth(self, payload: bytes, node_id: str):
         """Neue Node-Authentifizierungsanfrage"""

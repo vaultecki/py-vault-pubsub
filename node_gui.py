@@ -238,7 +238,6 @@ class NodeGUI(QMainWindow):
             self.node_thread.start()
 
             # Warte bis Node initialisiert ist
-            #asyncio.sleep(2)
             time.sleep(2)
             self.node = self.node_thread.node
 

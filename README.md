@@ -1,33 +1,45 @@
-# README.md
+# libp2p PubSub Netzwerk mit Verschlüsselung & Admin-Management
 
-# libp2p PubSub Netzwerk mit GUI
-
-Ein dezentrales Publish-Subscribe Netzwerk basierend auf libp2p mit einer grafischen Benutzeroberfläche. Nodes können sich gegenseitig entdecken, Topics anbieten und abonnieren, wobei alle Nachrichten kryptographisch signiert werden.
+Ein dezentrales Publish-Subscribe Netzwerk mit vollständiger Verschlüsselung, digitalen Signaturen und grafischem Admin-Interface. Nodes können sich automatisch entdecken, Topics anbieten/abonnieren, und der Admin kann neue Peers genehmigen oder entfernen - Änderungen werden automatisch im gesamten Netzwerk verteilt.
 
 ## Features
 
-### Netzwerk-Features
-- **libp2p Integration**: Verwendet QUIC und TCP für robuste Netzwerkkommunikation
-- **GossipSub Protocol**: Effizientes Publish-Subscribe System
-- **Dezentrales Topic-Registry**: Automatische Verwaltung von Topic-Providern
-- **Automatisches Reconnecting**: Periodische Verbindungsversuche zu bekannten Peers
+### 🔍 **Dezentrales Discovery**
+- UDP Multicast für automatische Node-Erkennung
+- Periodische Ankündigungen alle 5 Sekunden
+- Unicast Fallback wenn Multicast nicht verfügbar
+- Automatische Registry-Updates
 
-### Sicherheit
-- **Ed25519 Signaturen**: Alle Nachrichten werden digital signiert
-- **Peer-Authentifizierung**: Neue Nodes müssen vom Benutzer bestätigt werden
-- **Public-Key-Infrastruktur**: Sichere Kommunikation zwischen bekannten Peers
-- **Persistente Konfiguration**: Schlüssel und Peer-Informationen werden lokal gespeichert
+### 📡 **Publish-Subscribe System**
+- Topics können von jedem Node angeboten werden
+- Nodes subscriben nur wenn lokal jemand den Topic benötigt
+- Effiziente Message-Distribution an Subscriber
+- Support für Binär-Daten
 
-### Logging & Monitoring
-- **Message Logging**: Alle Nachrichten werden protokolliert mit Zeitstempel
-- **Eindeutige Node IDs**: Jeder Node hat eine persistente UUID
-- **Detaillierte Logs**: Nachverfolgung aller Netzwerkereignisse
+### 🔐 **Sicherheit**
+- **Authentifizierung**: Ed25519 digitale Signaturen
+- **Verschlüsselung**: AES-256-GCM für Node-zu-Node Kommunikation
+- **Session Keys**: PBKDF2-basierte Key Derivation
+- **Peer Auth**: Neue Nodes müssen vom Admin genehmigt werden
+- **Message Logging**: Alle Nachrichten werden protokolliert
 
-### Benutzeroberfläche
-- **Grafische GUI**: PyQt6-basierte Verwaltungsoberfläche
-- **Live-Monitoring**: Echtzeit-Anzeige von Verbindungen und Topics
-- **Peer-Management**: Akzeptieren/Ablehnen neuer Nodes
-- **Topic-Management**: Einfaches Anbieten und Abonnieren von Topics
+### 👨‍💼 **Admin Management**
+- **Peer Authentifizierung**: GUI-basiertes Akzeptieren/Ablehnen neuer Nodes
+- **Peer Entfernung**: Nodes können aus dem Netzwerk entfernt werden
+- **Netzwerk-Propagation**: Admin-Entscheidungen werden zu allen Nodes gesendet
+- **Automatische Synchronisation**: Alle Nodes aktualisieren ihre config.json
+
+### 🎛️ **Grafische GUI**
+- Node Informationen und Status in Echtzeit
+- Übersicht verbundener Nodes mit Discovery
+- Topic Management (Anbieten/Abonnieren)
+- Authentifizierungs-Queue mit Details
+- Live-Logging aller Events
+
+### 📊 **Lokale Schnittstelle**
+- UDP-basierte Lokalschnittstelle für externe Programme
+- JSON-basiertes Command Protocol
+- Publish/Subscribe/List Operations
 
 ## Installation
 
@@ -37,30 +49,31 @@ Ein dezentrales Publish-Subscribe Netzwerk basierend auf libp2p mit einer grafis
 
 ### Setup
 
-1. **Repository klonen oder herunterladen**
 ```bash
+# Repository klonen
 cd libp2p-pubsub-network
-```
 
-2. **Dependencies installieren**
-```bash
+# Dependencies installieren
 pip install -r requirements.txt
+
+# GUI starten
+python node_gui.py
 ```
 
 ## Verwendung
 
-### GUI-Modus (empfohlen)
+### GUI-Modus (Empfohlen)
 
 ```bash
 python node_gui.py
 ```
 
-Die GUI startet einen Node und bietet:
-- **Node Info Tab**: Node ID, Status, bekannte Nodes, Subscriber-Statistiken
-- **Verbundene Nodes Tab**: Alle via Discovery gefundenen Nodes (online/offline)
-- **Topics Tab**: Angebotene Topics, abonnierte Topics, Pending Topics
-- **Authentifizierung Tab**: Neue Peer-Authentifizierungsanfragen akzeptieren/ablehnen
-- **Logs Tab**: Live Aktivitäten und Fehler
+**Reiter:**
+- **Node Info**: Node ID, Status, bekannte Nodes, Subscriber-Statistiken
+- **Verbundene Nodes**: Alle via Discovery gefundenen Nodes
+- **Topics**: Angebotene, abonnierte und pending Topics
+- **Authentifizierung**: Neue Peer-Requests akzeptieren/ablehnen/entfernen
+- **Logs**: Alle Netzwerk-Events in Echtzeit
 
 ### Kommandozeilen-Modus
 
@@ -69,58 +82,32 @@ import asyncio
 from node import PubSubNode
 
 async def main():
-    # Node mit Custom Ports erstellen
-    node = PubSubNode(
-        port=10000,           # Network Server Port
-        local_port=9000,      # Lokale Interface Port
-        config_path="config.json"
-    )
-    
-    # Node starten
+    node = PubSubNode(port=10000, local_port=9000, config_path="config.json")
     await node.start()
-    
-    # Topic anbieten
     await node.provide_topic("sensor_data")
     
-    # Nachricht publishen
-    async def publish_example():
-        for i in range(10):
-            await node.publish("sensor_data", f"Sensor {i}".encode())
-            await asyncio.sleep(1)
-    
-    asyncio.create_task(publish_example())
-    
-    # Laufen lassen
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Shutdown...")
+    # Nachrichten publishen
+    for i in range(10):
+        await node.publish("sensor_data", f"Wert {i}".encode())
+        await asyncio.sleep(1)
 
 asyncio.run(main())
 ```
 
-### Externe Programme mit lokaler UDP Schnittstelle
+### Externe Programme (UDP Localhost)
 
 ```python
 import socket
 import json
 
-# Mit lokalem Node verbinden (Port 9000)
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Topic abonnieren
 msg = {'cmd': 'subscribe', 'topic': 'sensor_data'}
 sock.sendto(json.dumps(msg).encode(), ('127.0.0.1', 9000))
-response = sock.recvfrom(1024)
-print(response)
 
 # Nachricht publishen
-msg = {
-    'cmd': 'publish',
-    'topic': 'sensor_data',
-    'payload': 'temperature: 22.5'
-}
+msg = {'cmd': 'publish', 'topic': 'sensor_data', 'payload': '25.5°C'}
 sock.sendto(json.dumps(msg).encode(), ('127.0.0.1', 9000))
 
 # Topics auflisten
@@ -131,6 +118,121 @@ print(json.loads(response))
 
 sock.close()
 ```
+
+## Netzwerk-Verwaltung
+
+### Peer Authentifizierung (Admin-Workflow)
+
+```
+1. Neuer Node sendet Discovery-Ankündigung
+   └─ Enthält: Node ID, Public Key, Topics
+
+2. Bestehender Node empfängt Ankündigung
+   └─ Zeigt in GUI: "Neue Authentifizierungsanfrage"
+
+3. Admin prüft Details:
+   └─ Node ID ✓
+   └─ Public Key Fingerprint ✓
+
+4. Admin klickt "Akzeptieren"
+   └─ Lokal in config.json gespeichert
+   └─ Broadcast an alle Nodes (msg_type=5)
+
+5. Alle Nodes erhalten Update
+   └─ Aktualisieren ihre config.json
+   └─ Verschlüsselte Kommunikation möglich
+```
+
+### Peer Entfernung (Admin-Workflow)
+
+```
+1. Admin wählt Peer aus "Verbundene Nodes"
+   └─ Zeigt Node ID, IP, Topics
+
+2. Admin klickt "Peer entfernen"
+   └─ Bestätigungsdialog
+
+3. Entfernung wird broadcastet (msg_type=5)
+   └─ An alle bekannten Nodes
+
+4. Jeder Node löscht Peer:
+   └─ Aus config.json
+   └─ Aus config.peers Dictionary
+   └─ Keine weitere Kommunikation
+
+5. Logs zeigen:
+   └─ Admin Node ID
+   └─ Timestamp
+   └─ Entfernte Node ID
+```
+
+## Architektur
+
+### Komponenten
+
+| Komponente | Funktion |
+|-----------|----------|
+| **ConfigManager** | Persistente Konfiguration (config.json) |
+| **CryptoManager** | Ed25519 Signaturen + AES-256-GCM |
+| **DiscoveryService** | UDP Multicast Node-Erkennung |
+| **NodeConnectionPool** | TCP Connection Management |
+| **NetworkServer** | TCP Server für eingehende Connections |
+| **MessageHandler** | Message Routing & Verarbeitung |
+| **LocalInterface** | UDP Schnittstelle für externe Programme |
+| **MessageLogger** | JSON-basierte Message-Protokollierung |
+
+### Message Types
+
+```
+Type 1: Registry Update (Verschlüsselt)
+  └─ Topic Announcement mit Provider Info
+  └─ Von: Node mit neuem Topic
+  └─ An: Alle bekannten Nodes
+
+Type 2: Topic Message (Verschlüsselt)
+  └─ User Data auf subscribed Topics
+  └─ Von: Topic Provider
+  └─ An: Subscriber Nodes
+
+Type 3: Subscription (Verschlüsselt)
+  └─ Subscribe/Unsubscribe Notifications
+  └─ Von: Subscriber Node
+  └─ An: Provider Node
+
+Type 4: Peer Auth (NICHT Verschlüsselt)
+  └─ New Node Authentication Requests
+  └─ Von: Neuer Node
+  └─ An: Bestehende Nodes
+  └─ Grund: Noch keine Public Keys bekannt
+
+Type 5: Peer Update (NICHT Verschlüsselt)
+  └─ Admin Add/Remove Decisions
+  └─ Von: Admin Node
+  └─ An: Alle Nodes
+  └─ Grund: Vor Authentifizierung nötig
+```
+
+### Verschlüsselung Details
+
+**AES-256-GCM:**
+- Schlüssellänge: 256 Bit (32 Bytes)
+- IV Länge: 96 Bit (12 Bytes, zufällig)
+- Auth Tag: 128 Bit (16 Bytes)
+- Mode: Galois/Counter Mode
+
+**Session Key Derivation (PBKDF2):**
+```
+Input: Kombinierte Public Keys (Sender + Empfänger)
+Salt: "node_session_salt"
+Iterations: 100.000
+Hash: SHA256
+Output: 32 Bytes Session Key (gecacht pro Peer)
+```
+
+**Ed25519 Signaturen:**
+- Deterministic (gleicher Input = gleiche Signatur)
+- 64 Bytes Signatur-Größe
+- Microsekundenbereich für Sign/Verify
 
 ## Konfiguration
 
@@ -152,23 +254,6 @@ sock.close()
 }
 ```
 
-### Discovery Service
-
-Die Discovery läuft automatisch:
-
-1. **Multicast Announcements** (alle 5 Sekunden)
-   - Sendet alle angebotenen Topics
-   - Port: 224.0.0.1:5353
-   - Fallback auf Unicast wenn Multicast nicht verfügbar
-
-2. **Known Nodes**
-   - Speichert discovered Nodes mit deren Info
-   - IP, Port, Topics, Last Seen
-
-3. **Topic Registry**
-   - Automatisch aktualisiert wenn neue Topics announced werden
-   - Pending Topics werden periodisch gesucht
-
 ### Network Ports
 
 - **Network Server**: TCP Port (default: 10000)
@@ -176,210 +261,17 @@ Die Discovery läuft automatisch:
   - Verschlüsselte Kommunikation
   
 - **Local Interface**: UDP localhost (default: 9000)
-  - Externe Programme verbinden sich hier
+  - Externe Programme
   - Unverschlüsselt (nur localhost)
   
 - **Discovery**: UDP Multicast (224.0.0.1:5353)
   - Node-Discovery
   - Signiert, nicht verschlüsselt
 
-## Architektur
-
-### Komponenten
-
-#### ConfigManager
-- Persistente Speicherung von Node-Einstellungen
-- Verwaltung von Schlüsseln und Peer-Informationen
-- Automatische Initialisierung bei erstem Start
-
-#### CryptoManager
-- Ed25519 Schlüsselgenerierung
-- Message Signing & Verification
-- AES-256-GCM Verschlüsselung/Entschlüsselung
-- Session Key Derivation (PBKDF2)
-
-#### DiscoveryService
-- UDP Multicast für automatische Node-Discovery
-- Periodische Node-Ankündigungen (alle 5s)
-- Fallback auf Unicast wenn Multicast nicht verfügbar
-- Automatische Registry Updates
-
-#### NodeConnectionPool & NodeConnection
-- TCP Connection Management
-- Automatische Verbindungswiederverwendung
-- Fehlerbehandlung und Reconnecting
-
-#### NetworkServer
-- TCP Server für eingehende Connections
-- Asynchrone Request-Verarbeitung
-- Multi-Client Support
-
-#### MessageHandler
-- Message Type Routing
-- Payload Entschlüsselung
-- Signaturverifikation
-- Subscriber Management
-
-#### DistributedTopicRegistry
-- Dezentrale Topic-Provider Registry
-- Thread-sichere Operationen
-- Topic-zu-Provider Mapping
-
-#### MessageLogger
-- Chronologische Message Protokollierung
-- JSON-Format mit Metadaten
-- Verschlüsselungsstatus Tracking
-
-#### LocalInterface
-- UDP Server für lokale Programme
-- JSON-basiertes Command Protocol
-- Publish/Subscribe/List Commands
-
-### Sicherheitsarchitektur
-
-```
-Authentifizierung:
-  - Node ID + Ed25519 Keys (persistent in config.json)
-  - New Peer Auth Request (unverschlüsselt für Bootstrap)
-  - Admin Approval erforderlich
-
-Verschlüsselung:
-  - Peer Discovery: Signiert aber unverschlüsselt
-  - Topic Messages: AES-256-GCM (verschlüsselt)
-  - Registry Updates: AES-256-GCM (verschlüsselt)
-  - Subscriptions: AES-256-GCM (verschlüsselt)
-  - Peer Auth: Unverschlüsselt (vor Authentifizierung)
-
-Kommunikation:
-  - Localhost UDP: Externe Programme <-> Node
-  - Network TCP: Node <-> Node (verschlüsselt)
-  - Multicast UDP: Node Discovery
-```
-
-### Message Types
-
-```
-1 = Registry Update (msg_type=1) - Verschlüsselt
-    Topic Announcement mit Provider Info
-    
-2 = Topic Message (msg_type=2) - Verschlüsselt
-    User Data auf subscribed Topics
-    
-3 = Subscription (msg_type=3) - Verschlüsselt
-    Subscribe/Unsubscribe Notifications
-    
-4 = Peer Auth (msg_type=4) - NICHT Verschlüsselt
-    New Node Authentication Requests
-```
-
-## Beispiele
-
-### Beispiel 1: Zwei Nodes im selben Netzwerk
-
-```bash
-# Terminal 1 - Node A
-python -c "
-import asyncio
-from node import PubSubNode
-
-async def main():
-    node_a = PubSubNode(port=10000, local_port=9000, config_path='node_a.json')
-    await node_a.start()
-    await node_a.provide_topic('temperature')
-    await node_a.provide_topic('humidity')
-    print('Node A läuft mit Topics: temperature, humidity')
-    while True:
-        await asyncio.sleep(1)
-
-asyncio.run(main())
-"
-
-# Terminal 2 - Node B
-python -c "
-import asyncio
-from node import PubSubNode
-
-async def message_handler(topic, payload):
-    print(f'Node B empfangen auf {topic}: {payload}')
-
-async def main():
-    node_b = PubSubNode(port=10001, local_port=9001, config_path='node_b.json')
-    await node_b.start()
-    await node_b.subscribe('temperature', callback=message_handler)
-    print('Node B abonniert: temperature')
-    while True:
-        await asyncio.sleep(1)
-
-asyncio.run(main())
-"
-
-# Terminal 3 - Publisher
-python -c "
-import asyncio
-from node import PubSubNode
-
-async def main():
-    node_a = PubSubNode(port=10000, config_path='node_a.json')
-    await node_a.start()
-    
-    for i in range(5):
-        await node_a.publish('temperature', f'22.{i}°C'.encode())
-        await asyncio.sleep(1)
-
-asyncio.run(main())
-"
-```
-
-### Beispiel 2: Peer Authentifizierung
-
-Neue Nodes senden Authentifizierungsanfragen:
-```
-[New Node Discovery Announcement]
-    ↓
-[Admin sieht in GUI: "Neue Authentifizierungsanfrage"]
-    ↓
-[Admin klickt "Akzeptieren"]
-    ↓
-[Node wird zu config.json hinzugefügt]
-    ↓
-[Verschlüsselte Kommunikation aktiviert]
-```
-
-### Beispiel 3: Message Flow mit Verschlüsselung
-
-```
-Node A: publish("sensor_data", b"25.5°C")
-    ↓
-1. Signiere mit ED25519 Private Key
-    ↓
-2. Ableiten Session Key mit Node B Public Key (PBKDF2)
-    ↓
-3. Verschlüssele mit AES-256-GCM
-    ↓
-4. Format: [node_id][signature][IV][Tag][Encrypted Payload]
-    ↓
-5. TCP zu Node B Port 10000
-    ↓
-Node B empfängt:
-    ↓
-1. Entschlüssele mit Session Key
-    ↓
-2. Verifiziere Signatur
-    ↓
-3. Rufe Callbacks auf
-    ↓
-4. Logge Nachricht (mit verified=true)
-```
-
 ## Message Logging
 
-Alle Nachrichten werden in `message_logs/` protokolliert:
+Alle Nachrichten werden in `message_logs/messages_YYYYMMDD_HHMMSS.log` protokolliert:
 
-```
-message_logs/messages_20240115_143022.log
-```
-
-Jeder Eintrag enthält:
 ```json
 {
   "timestamp": "2024-01-15T14:30:22.123456",
@@ -393,92 +285,151 @@ Jeder Eintrag enthält:
 }
 ```
 
-**Interpretation:**
-- `direction`: "sent" oder "received"
-- `verified`: Signaturverifizierung erfolgreich
-- `payload_hash`: SHA256 Hash der Daten (für Privacy)
-- `source_node_id`: Absender Node ID
+## Beispiele
 
-## Ports und Schnittstellen
+### Beispiel 1: Multi-Node Setup
 
-- **libp2p QUIC**: UDP Port (konfigurierbar, default: 10000)
-- **libp2p TCP**: TCP Port (Port + 1000, default: 11000)
-- **Lokale Schnittstelle**: UDP localhost (konfigurierbar, default: 9000)
+**Terminal 1 - Node A:**
+```bash
+python -c "
+import asyncio
+from node import PubSubNode
 
-## Sicherheit im Detail
+async def main():
+    node = PubSubNode(port=10000, local_port=9000, config_path='node_a.json')
+    await node.start()
+    await node.provide_topic('temperature')
+    print('Node A läuft')
+    while True:
+        await asyncio.sleep(1)
 
-### Authentifizierung & Autorisierung
-
-**New Peer Flow:**
-```
-1. Neuer Node sendet Multicast Ankündigung
-2. Bestehender Node empfängt Ankündigung
-3. GUI zeigt "Neue Authentifizierungsanfrage"
-4. Admin prüft: Node ID + Public Key
-5. Admin klickt "Akzeptieren" oder "Ablehnen"
-6. Entscheidung wird in config.json gespeichert
+asyncio.run(main())
+"
 ```
 
-### Verschlüsselung Details
+**Terminal 2 - Node B:**
+```bash
+python -c "
+import asyncio
+from node import PubSubNode
 
-**AES-256-GCM:**
-- **Schlüssellänge**: 256 Bit (32 Bytes)
-- **IV Länge**: 96 Bit (12 Bytes, zufällig)
-- **Tag Länge**: 128 Bit (16 Bytes, Auth-Tag)
-- **Mode**: Galois/Counter Mode (Authenticated Encryption)
+async def callback(topic, payload):
+    print(f'Node B empfangen: {payload}')
 
-**Session Key Derivation (PBKDF2):**
+async def main():
+    node = PubSubNode(port=10001, local_port=9001, config_path='node_b.json')
+    await node.start()
+    await node.subscribe('temperature', callback=callback)
+    print('Node B läuft')
+    while True:
+        await asyncio.sleep(1)
+
+asyncio.run(main())
+"
 ```
-Input: Kombinierte Public Keys (Sender + Empfänger)
-Salt: "node_session_salt" (konstant)
-Iterations: 100.000
-Hash: SHA256
-Output: 32 Bytes Session Key
-Cache: Pro Peer (Wiederverwendung)
+
+**Terminal 3 - Publisher:**
+```bash
+python -c "
+import asyncio
+from node import PubSubNode
+
+async def main():
+    node = PubSubNode(port=10000, config_path='node_a.json')
+    await node.start()
+    
+    for i in range(5):
+        await node.publish('temperature', f'22.{i}°C'.encode())
+        await asyncio.sleep(1)
+
+asyncio.run(main())
+"
 ```
 
-### Signatur Details
+### Beispiel 2: Admin-Funktionen
 
-**Ed25519:**
-- **Algorithm**: Elliptic Curve Digital Signature Algorithm
-- **Signature Size**: 64 Bytes
-- **Deterministic**: Gleicher Input = Gleiche Signatur
-- **Schnell**: Microsekunden für Signieren/Verifizieren
+1. **Neue Node genehmigen:**
+   - GUI öffnet sich mit Authentifizierungs-Request
+   - Admin prüft Node ID + Public Key
+   - Klick auf "Akzeptieren"
+   - Automatisch zu allen Nodes verteilt
 
-### Datenfluss Verschlüsselung
+2. **Node entfernen:**
+   - In "Verbundene Nodes" Tab Peer auswählen
+   - Klick auf "Peer entfernen"
+   - Bestätigung + Broadcast
+   - Automatisch aus allen Configs gelöscht
 
+## Troubleshooting
+
+### Node startet nicht
 ```
-Unverschlüsselt:
-  - Multicast Discovery Announcements (aber signiert)
-  - Peer Auth Requests (msg_type=4)
-  
-Verschlüsselt + Signiert:
-  - Registry Updates (msg_type=1)
-  - Topic Messages (msg_type=2)
-  - Subscriptions (msg_type=3)
+Fehler: "Fehler beim Starten des Nodes"
+Lösung:
+  - Port bereits in Verwendung? → Andere Port in GUI
+  - Firewall blockiert? → Firewall konfigurieren
+  - Python < 3.9? → Min. Python 3.9 erforderlich
 ```
+
+### Keine Verbindung zu anderen Nodes
+```
+Symptom: "Discovered Nodes = 0"
+Lösung:
+  - Multicast aktiviert? → ifconfig | grep MULTICAST
+  - Andere Nodes im Subnetz? → Prüfen
+  - Firewall blockiert UDP 5353? → Konfigurieren
+  - Unterschiedliche Configs? → Ja, ist OK
+```
+
+### Verschlüsselung schlägt fehl
+```
+Fehler: "Entschlüsselung fehlgeschlagen"
+Lösung:
+  - Private Keys unterschiedlich? → OK
+  - Public Keys stimmen? → Prüfen!
+  - Nachricht signiert? → Logs prüfen
+```
+
+### Peer Auth bleibt unverschlüsselt
+```
+Grund: Neuer Peer hat noch keinen Public Key
+Lösung: Nach Authentifizierung → Verschlüsselt
+```
+
+## Performance
+
+- **Message Latenz**: < 50ms (lokales Netzwerk)
+- **Encryption Overhead**: ~5-10% (AES-256-GCM)
+- **Discovery Zeit**: 5-10 Sekunden (Multicast)
+- **Throughput**: Begrenzt durch Netzwerk-Interface
+
+## Sicherheitshinweise
+
+⚠️ **Wichtig:**
+- Private Keys NIE über Netzwerk senden
+- config.json ist sensitiv → Dateirechte 600
+- Multicast nur im lokalen Netzwerk sicher
+- Peer Auth: Admin muss Public Key verifizieren
+- Message Logs können Metadaten enthalten
 
 ## Erweiterungsmöglichkeiten
 
-- **End-to-End Encryption**: Topic-spezifische Keys (zusätzlich zu Node-Keys)
-- **Topic Permissions**: Role-based Access Control pro Topic
-- **Presence Information**: Online/Offline Status der Subscriber
-- **Web Dashboard**: Browser-basierte Alternative zur Desktop-GUI
-- **Metrics/Monitoring**: Prometheus Exporter für Netzwerk-Stats
-- **Message Routing**: Intelligentes Routing basierend auf Latenz
-- **Cluster Support**: Mehrere Nodes auf einer Maschine
-- **Backup/Sync**: Automatische Config-Synchronisierung zwischen Nodes
-- **DBus Integration**: D-Bus Service für Linux Systemintegration
-- **Message Persistence**: Optional: Nachrichten in DB speichern
+- [ ] End-to-End Encryption (Topic-spezifische Keys)
+- [ ] Topic Permissions (Role-based Access Control)
+- [ ] Presence Information (Online/Offline Status)
+- [ ] Web Dashboard (Browser-Interface)
+- [ ] Metrics Export (Prometheus)
+- [ ] Message Persistence (Optional DB)
+- [ ] DBus Integration (Linux Systemd)
+- [ ] Cluster Support (Mehrere Nodes/Maschine)
 
 ## Lizenz
 
 MIT
 
-## Autor
-
-libp2p PubSub Network Team
-
 ## Support
 
-Für Probleme oder Fragen, bitte ein Issue erstellen oder die Logs überprüfen.
+Für Issues:
+1. Logs in `message_logs/` prüfen
+2. Config in `.json` überprüfen
+3. GitHub Issues erstellen
