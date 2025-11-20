@@ -297,7 +297,7 @@ Jeder Eintrag enthält:
 
 ## Lizenz
 
-MIT
+Apache 2.0
 
 ## Autor
 
