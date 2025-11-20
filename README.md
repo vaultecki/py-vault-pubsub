@@ -32,7 +32,7 @@ Ein dezentrales Publish-Subscribe Netzwerk basierend auf libp2p mit einer grafis
 ## Installation
 
 ### Anforderungen
-- Python 3.8+
+- Python 3.9+
 - pip
 
 ### Setup
@@ -52,25 +52,29 @@ pip install -r requirements.txt
 ### GUI-Modus (empfohlen)
 
 ```bash
-python gui.py
+python node_gui.py
 ```
 
-Dies startet die grafische Benutzeroberfläche. Von dort aus kannst du:
-- Den Node starten/stoppen
-- Port und Konfigurationsdatei einstellen
-- Topics anbieten und abonnieren
-- Verbundene Nodes verwalten
-- Neue Peers authentifizieren
+Die GUI startet einen Node und bietet:
+- **Node Info Tab**: Node ID, Status, bekannte Nodes, Subscriber-Statistiken
+- **Verbundene Nodes Tab**: Alle via Discovery gefundenen Nodes (online/offline)
+- **Topics Tab**: Angebotene Topics, abonnierte Topics, Pending Topics
+- **Authentifizierung Tab**: Neue Peer-Authentifizierungsanfragen akzeptieren/ablehnen
+- **Logs Tab**: Live Aktivitäten und Fehler
 
 ### Kommandozeilen-Modus
 
 ```python
 import asyncio
-from libp2p_pubsub_network import PubSubNode
+from node import PubSubNode
 
 async def main():
-    # Node erstellen
-    node = PubSubNode(port=10000, local_port=9000)
+    # Node mit Custom Ports erstellen
+    node = PubSubNode(
+        port=10000,           # Network Server Port
+        local_port=9000,      # Lokale Interface Port
+        config_path="config.json"
+    )
     
     # Node starten
     await node.start()
@@ -78,17 +82,54 @@ async def main():
     # Topic anbieten
     await node.provide_topic("sensor_data")
     
-    # Nachrichten publishen
-    await node.publish("sensor_data", b"Test message")
+    # Nachricht publishen
+    async def publish_example():
+        for i in range(10):
+            await node.publish("sensor_data", f"Sensor {i}".encode())
+            await asyncio.sleep(1)
     
-    # Auf Events warten
+    asyncio.create_task(publish_example())
+    
+    # Laufen lassen
     try:
         while True:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        pass
+        logger.info("Shutdown...")
 
 asyncio.run(main())
+```
+
+### Externe Programme mit lokaler UDP Schnittstelle
+
+```python
+import socket
+import json
+
+# Mit lokalem Node verbinden (Port 9000)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# Topic abonnieren
+msg = {'cmd': 'subscribe', 'topic': 'sensor_data'}
+sock.sendto(json.dumps(msg).encode(), ('127.0.0.1', 9000))
+response = sock.recvfrom(1024)
+print(response)
+
+# Nachricht publishen
+msg = {
+    'cmd': 'publish',
+    'topic': 'sensor_data',
+    'payload': 'temperature: 22.5'
+}
+sock.sendto(json.dumps(msg).encode(), ('127.0.0.1', 9000))
+
+# Topics auflisten
+msg = {'cmd': 'list_topics'}
+sock.sendto(json.dumps(msg).encode(), ('127.0.0.1', 9000))
+response, _ = sock.recvfrom(4096)
+print(json.loads(response))
+
+sock.close()
 ```
 
 ## Konfiguration
@@ -101,8 +142,8 @@ asyncio.run(main())
   "private_key": "-----BEGIN PRIVATE KEY-----\n...",
   "public_key": "-----BEGIN PUBLIC KEY-----\n...",
   "peers": {
-    "node_id_1": {
-      "peer_id": "QmXxxx...",
+    "peer_node_id_1": {
+      "peer_id": "peer_node_id_1",
       "public_key": "-----BEGIN PUBLIC KEY-----\n...",
       "timestamp": 1234567890.123
     }
@@ -110,6 +151,37 @@ asyncio.run(main())
   "dht_bootstrap_peers": []
 }
 ```
+
+### Discovery Service
+
+Die Discovery läuft automatisch:
+
+1. **Multicast Announcements** (alle 5 Sekunden)
+   - Sendet alle angebotenen Topics
+   - Port: 224.0.0.1:5353
+   - Fallback auf Unicast wenn Multicast nicht verfügbar
+
+2. **Known Nodes**
+   - Speichert discovered Nodes mit deren Info
+   - IP, Port, Topics, Last Seen
+
+3. **Topic Registry**
+   - Automatisch aktualisiert wenn neue Topics announced werden
+   - Pending Topics werden periodisch gesucht
+
+### Network Ports
+
+- **Network Server**: TCP Port (default: 10000)
+  - Eingehende Node-zu-Node Connections
+  - Verschlüsselte Kommunikation
+  
+- **Local Interface**: UDP localhost (default: 9000)
+  - Externe Programme verbinden sich hier
+  - Unverschlüsselt (nur localhost)
+  
+- **Discovery**: UDP Multicast (224.0.0.1:5353)
+  - Node-Discovery
+  - Signiert, nicht verschlüsselt
 
 ## Architektur
 
@@ -122,116 +194,181 @@ asyncio.run(main())
 
 #### CryptoManager
 - Ed25519 Schlüsselgenerierung
-- Nachrichtensignierung
-- Signaturverifikation
+- Message Signing & Verification
+- AES-256-GCM Verschlüsselung/Entschlüsselung
+- Session Key Derivation (PBKDF2)
 
-#### DistributedTopicRegistry
-- Dezentrale Verwaltung von Topic-Providern
-- Automatische Registry-Updates zwischen Nodes
-- Topic-Suche und Discovery
+#### DiscoveryService
+- UDP Multicast für automatische Node-Discovery
+- Periodische Node-Ankündigungen (alle 5s)
+- Fallback auf Unicast wenn Multicast nicht verfügbar
+- Automatische Registry Updates
+
+#### NodeConnectionPool & NodeConnection
+- TCP Connection Management
+- Automatische Verbindungswiederverwendung
+- Fehlerbehandlung und Reconnecting
+
+#### NetworkServer
+- TCP Server für eingehende Connections
+- Asynchrone Request-Verarbeitung
+- Multi-Client Support
 
 #### MessageHandler
-- Verarbeitung eingehender Nachrichten
+- Message Type Routing
+- Payload Entschlüsselung
 - Signaturverifikation
-- Peer-Authentifizierungsanfragen
+- Subscriber Management
 
-#### PubSubNode
-- Zentrale Node-Klasse
-- libp2p Host Management
-- GossipSub Integration
-- Automatisches Reconnecting
-
-#### LocalInterface
-- UDP-basierte lokale Schnittstelle
-- Externe Programme können sich verbinden
-- JSON-basiertes Command Protocol
+#### DistributedTopicRegistry
+- Dezentrale Topic-Provider Registry
+- Thread-sichere Operationen
+- Topic-zu-Provider Mapping
 
 #### MessageLogger
-- Protokollierung aller Nachrichten
-- Zeitstempel und Metadaten
-- Separate Log-Dateien pro Sitzung
+- Chronologische Message Protokollierung
+- JSON-Format mit Metadaten
+- Verschlüsselungsstatus Tracking
 
-### Kommunikationsprotokolle
+#### LocalInterface
+- UDP Server für lokale Programme
+- JSON-basiertes Command Protocol
+- Publish/Subscribe/List Commands
 
-#### Topic-Registry-Protokoll (`/topic-registry/1.0.0`)
-Nodes teilen ihre verfügbaren Topics mit anderen Nodes.
+### Sicherheitsarchitektur
 
-**Format:**
 ```
-[type:1][node_id_len:2][node_id:var][sig_len:4][signature:var][payload:var]
+Authentifizierung:
+  - Node ID + Ed25519 Keys (persistent in config.json)
+  - New Peer Auth Request (unverschlüsselt für Bootstrap)
+  - Admin Approval erforderlich
+
+Verschlüsselung:
+  - Peer Discovery: Signiert aber unverschlüsselt
+  - Topic Messages: AES-256-GCM (verschlüsselt)
+  - Registry Updates: AES-256-GCM (verschlüsselt)
+  - Subscriptions: AES-256-GCM (verschlüsselt)
+  - Peer Auth: Unverschlüsselt (vor Authentifizierung)
+
+Kommunikation:
+  - Localhost UDP: Externe Programme <-> Node
+  - Network TCP: Node <-> Node (verschlüsselt)
+  - Multicast UDP: Node Discovery
 ```
 
-#### Message-Protokoll (`/pubsub-message/1.0.0`)
-Nachrichten zwischen Nodes über Streams.
+### Message Types
 
-**Format:**
 ```
-[type:1][node_id_len:2][node_id:var][sig_len:4][signature:var][topic_len:2][topic:var][data:var]
+1 = Registry Update (msg_type=1) - Verschlüsselt
+    Topic Announcement mit Provider Info
+    
+2 = Topic Message (msg_type=2) - Verschlüsselt
+    User Data auf subscribed Topics
+    
+3 = Subscription (msg_type=3) - Verschlüsselt
+    Subscribe/Unsubscribe Notifications
+    
+4 = Peer Auth (msg_type=4) - NICHT Verschlüsselt
+    New Node Authentication Requests
 ```
-
-#### Peer-Auth-Protokoll (`/peer-auth/1.0.0`)
-Authentifizierungsanfragen neuer Nodes.
 
 ## Beispiele
 
-### Beispiel 1: Zwei Nodes verbinden
+### Beispiel 1: Zwei Nodes im selben Netzwerk
 
-```python
+```bash
+# Terminal 1 - Node A
+python -c "
 import asyncio
-from libp2p_pubsub_network import PubSubNode
+from node import PubSubNode
 
 async def main():
-    # Node 1: Bietet Sensor-Daten an
-    node1 = PubSubNode(port=10000, local_port=9000, config_path="node1.json")
-    await node1.start()
-    await node1.provide_topic("sensors/temperature")
-    
-    # Node 2: Abonniert Sensor-Daten
-    node2 = PubSubNode(port=10001, local_port=9001, config_path="node2.json")
-    await node2.start()
-    
-    async def on_temperature(topic: str, payload: bytes):
-        print(f"Temperatur empfangen: {payload}")
-    
-    await node2.subscribe("sensors/temperature", callback=on_temperature)
-    
-    # Daten publishen
-    await node1.publish("sensors/temperature", b"25.5°C")
+    node_a = PubSubNode(port=10000, local_port=9000, config_path='node_a.json')
+    await node_a.start()
+    await node_a.provide_topic('temperature')
+    await node_a.provide_topic('humidity')
+    print('Node A läuft mit Topics: temperature, humidity')
+    while True:
+        await asyncio.sleep(1)
 
 asyncio.run(main())
+"
+
+# Terminal 2 - Node B
+python -c "
+import asyncio
+from node import PubSubNode
+
+async def message_handler(topic, payload):
+    print(f'Node B empfangen auf {topic}: {payload}')
+
+async def main():
+    node_b = PubSubNode(port=10001, local_port=9001, config_path='node_b.json')
+    await node_b.start()
+    await node_b.subscribe('temperature', callback=message_handler)
+    print('Node B abonniert: temperature')
+    while True:
+        await asyncio.sleep(1)
+
+asyncio.run(main())
+"
+
+# Terminal 3 - Publisher
+python -c "
+import asyncio
+from node import PubSubNode
+
+async def main():
+    node_a = PubSubNode(port=10000, config_path='node_a.json')
+    await node_a.start()
+    
+    for i in range(5):
+        await node_a.publish('temperature', f'22.{i}°C'.encode())
+        await asyncio.sleep(1)
+
+asyncio.run(main())
+"
 ```
 
-### Beispiel 2: Externe Programme verbinden (UDP)
+### Beispiel 2: Peer Authentifizierung
 
-```python
-import socket
-import json
+Neue Nodes senden Authentifizierungsanfragen:
+```
+[New Node Discovery Announcement]
+    ↓
+[Admin sieht in GUI: "Neue Authentifizierungsanfrage"]
+    ↓
+[Admin klickt "Akzeptieren"]
+    ↓
+[Node wird zu config.json hinzugefügt]
+    ↓
+[Verschlüsselte Kommunikation aktiviert]
+```
 
-# Mit lokalem Node verbinden
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+### Beispiel 3: Message Flow mit Verschlüsselung
 
-# Topic abonnieren
-msg = {
-    'cmd': 'subscribe',
-    'topic': 'sensor_data'
-}
-sock.sendto(json.dumps(msg).encode(), ('127.0.0.1', 9000))
-
-# Daten publishen
-msg = {
-    'cmd': 'publish',
-    'topic': 'sensor_data',
-    'payload': 'sensor_value_123'
-}
-sock.sendto(json.dumps(msg).encode(), ('127.0.0.1', 9000))
-
-# Topics auflisten
-msg = {'cmd': 'list_topics'}
-sock.sendto(json.dumps(msg).encode(), ('127.0.0.1', 9000))
-response, _ = sock.recvfrom(4096)
-print(response.decode())
-
-sock.close()
+```
+Node A: publish("sensor_data", b"25.5°C")
+    ↓
+1. Signiere mit ED25519 Private Key
+    ↓
+2. Ableiten Session Key mit Node B Public Key (PBKDF2)
+    ↓
+3. Verschlüssele mit AES-256-GCM
+    ↓
+4. Format: [node_id][signature][IV][Tag][Encrypted Payload]
+    ↓
+5. TCP zu Node B Port 10000
+    ↓
+Node B empfängt:
+    ↓
+1. Entschlüssele mit Session Key
+    ↓
+2. Verifiziere Signatur
+    ↓
+3. Rufe Callbacks auf
+    ↓
+4. Logge Nachricht (mit verified=true)
 ```
 
 ## Message Logging
@@ -243,13 +380,6 @@ message_logs/messages_20240115_143022.log
 ```
 
 Jeder Eintrag enthält:
-- Zeitstempel
-- Richtung (sent/received)
-- Topic-Name
-- Payload-Größe und Hash
-- Signatur (gekürzt)
-- Verifikationsstatus
-
 ```json
 {
   "timestamp": "2024-01-15T14:30:22.123456",
@@ -263,41 +393,87 @@ Jeder Eintrag enthält:
 }
 ```
 
+**Interpretation:**
+- `direction`: "sent" oder "received"
+- `verified`: Signaturverifizierung erfolgreich
+- `payload_hash`: SHA256 Hash der Daten (für Privacy)
+- `source_node_id`: Absender Node ID
+
 ## Ports und Schnittstellen
 
 - **libp2p QUIC**: UDP Port (konfigurierbar, default: 10000)
 - **libp2p TCP**: TCP Port (Port + 1000, default: 11000)
 - **Lokale Schnittstelle**: UDP localhost (konfigurierbar, default: 9000)
 
-## Troubleshooting
+## Sicherheit im Detail
 
-### Node startet nicht
-- Überprüfe, ob die Ports verfügbar sind
-- Überprüfe die Firewall-Einstellungen
-- Schau die Logs an: `message_logs/`
+### Authentifizierung & Autorisierung
 
-### Keine Verbindung zu anderen Nodes
-- Stelle sicher, dass beide Nodes mit gleichen Ports erreichbar sind
-- Überprüfe die Netzwerkverbindung
-- Prüfe auf Firewall-Blockierung
+**New Peer Flow:**
+```
+1. Neuer Node sendet Multicast Ankündigung
+2. Bestehender Node empfängt Ankündigung
+3. GUI zeigt "Neue Authentifizierungsanfrage"
+4. Admin prüft: Node ID + Public Key
+5. Admin klickt "Akzeptieren" oder "Ablehnen"
+6. Entscheidung wird in config.json gespeichert
+```
 
-### Peer-Authentifizierung schlägt fehl
-- Überprüfe, dass die Public Keys korrekt sind
-- Stelle sicher, dass der Peer bestätigt wurde
-- Schau in die config.json um zu sehen ob der Peer gespeichert ist
+### Verschlüsselung Details
+
+**AES-256-GCM:**
+- **Schlüssellänge**: 256 Bit (32 Bytes)
+- **IV Länge**: 96 Bit (12 Bytes, zufällig)
+- **Tag Länge**: 128 Bit (16 Bytes, Auth-Tag)
+- **Mode**: Galois/Counter Mode (Authenticated Encryption)
+
+**Session Key Derivation (PBKDF2):**
+```
+Input: Kombinierte Public Keys (Sender + Empfänger)
+Salt: "node_session_salt" (konstant)
+Iterations: 100.000
+Hash: SHA256
+Output: 32 Bytes Session Key
+Cache: Pro Peer (Wiederverwendung)
+```
+
+### Signatur Details
+
+**Ed25519:**
+- **Algorithm**: Elliptic Curve Digital Signature Algorithm
+- **Signature Size**: 64 Bytes
+- **Deterministic**: Gleicher Input = Gleiche Signatur
+- **Schnell**: Microsekunden für Signieren/Verifizieren
+
+### Datenfluss Verschlüsselung
+
+```
+Unverschlüsselt:
+  - Multicast Discovery Announcements (aber signiert)
+  - Peer Auth Requests (msg_type=4)
+  
+Verschlüsselt + Signiert:
+  - Registry Updates (msg_type=1)
+  - Topic Messages (msg_type=2)
+  - Subscriptions (msg_type=3)
+```
 
 ## Erweiterungsmöglichkeiten
 
-- DHT-Integration für besseres Discovery
-- DBus-Unterstützung für Linux
-- MQTT-Bridge für IoT-Kompatibilität
-- Web-Interface als Alternative zur Desktop-GUI
-- Message Encryption (zusätzlich zur Signatur)
-- Automatische Backup-Verwaltung
+- **End-to-End Encryption**: Topic-spezifische Keys (zusätzlich zu Node-Keys)
+- **Topic Permissions**: Role-based Access Control pro Topic
+- **Presence Information**: Online/Offline Status der Subscriber
+- **Web Dashboard**: Browser-basierte Alternative zur Desktop-GUI
+- **Metrics/Monitoring**: Prometheus Exporter für Netzwerk-Stats
+- **Message Routing**: Intelligentes Routing basierend auf Latenz
+- **Cluster Support**: Mehrere Nodes auf einer Maschine
+- **Backup/Sync**: Automatische Config-Synchronisierung zwischen Nodes
+- **DBus Integration**: D-Bus Service für Linux Systemintegration
+- **Message Persistence**: Optional: Nachrichten in DB speichern
 
 ## Lizenz
 
-Apache 2.0
+MIT
 
 ## Autor
 

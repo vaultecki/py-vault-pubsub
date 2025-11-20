@@ -1,6 +1,7 @@
 import sys
 import asyncio
 import json
+import time
 from typing import Optional
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
 from PyQt6.QtGui import QIcon, QColor, QTextCursor
 
-from libp2p_pubsub_network import PubSubNode, ConfigManager, CryptoManager
+from node import PubSubNode, ConfigManager, CryptoManager
 
 
 class PeerAuthSignal(QObject):
@@ -237,7 +238,8 @@ class NodeGUI(QMainWindow):
             self.node_thread.start()
 
             # Warte bis Node initialisiert ist
-            asyncio.sleep(2)
+            #asyncio.sleep(2)
+            time.sleep(2)
             self.node = self.node_thread.node
 
             self.start_btn.setEnabled(False)

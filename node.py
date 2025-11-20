@@ -10,21 +10,10 @@ import struct
 import uuid
 from pathlib import Path
 
-from libp2p import await_ready
-from libp2p.host.basic_host import BasicHost
-from libp2p.network.stream.exceptions import StreamEOF
-from libp2p.peer.peerinfo import PeerInfo
-from libp2p.peer.id import ID
-from libp2p.crypto.secp256k1 import create_new_private_key
-from libp2p.pubsub.pubsub import Pubsub
-from libp2p.pubsub.gossipsub import GossipSub
-from libp2p.transport.quic.transport import QuicTransport
-from libp2p.transport.tcp.transport import TCPTransport
-from multiaddr import Multiaddr
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.hazmat.backends import default_backend
-import hashlib
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf import pbkdf2 as PBKDF2
+from cryptography.hazmat.primitives import hashes
+import os
 
 logging.basicConfig(
     level=logging.INFO,
@@ -134,6 +123,7 @@ class CryptoManager:
         self.config = config
         self.private_key = None
         self.public_key = None
+        self.session_keys: Dict[str, bytes] = {}  # node_id -> shared_key
         self._load_or_create_keys()
 
     def _load_or_create_keys(self):
@@ -198,6 +188,72 @@ class CryptoManager:
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         ).decode()
 
+    def derive_session_key(self, peer_node_id: str, peer_public_key_pem: str) -> bytes:
+        """Session Key mit Peer ableiten (ECDH-like)"""
+        if peer_node_id in self.session_keys:
+            return self.session_keys[peer_node_id]
+
+        # Einfache Key Derivation: Hash von kombinierten Public Keys
+        combined = (self.get_public_key_pem() + peer_public_key_pem).encode()
+
+        kdf = PBKDF2(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b'node_session_salt',
+            iterations=100000,
+            backend=default_backend()
+        )
+
+        session_key = kdf.derive(combined)
+        self.session_keys[peer_node_id] = session_key
+
+        logger.debug(f"Session Key mit {peer_node_id[:8]}... erstellt")
+        return session_key
+
+    def encrypt_message(self, peer_node_id: str, peer_public_key_pem: str, plaintext: bytes) -> bytes:
+        """Nachricht mit AES-256-GCM verschlüsseln"""
+        session_key = self.derive_session_key(peer_node_id, peer_public_key_pem)
+
+        # IV generieren
+        iv = os.urandom(12)
+
+        # AES-256-GCM Cipher
+        cipher = Cipher(
+            algorithms.AES(session_key),
+            modes.GCM(iv),
+            backend=default_backend()
+        )
+        encryptor = cipher.encryptor()
+
+        ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+
+        # Format: [iv:12][tag:16][ciphertext:variable]
+        return iv + encryptor.tag + ciphertext
+
+    def decrypt_message(self, peer_node_id: str, peer_public_key_pem: str, encrypted: bytes) -> bytes:
+        """Nachricht mit AES-256-GCM entschlüsseln"""
+        try:
+            session_key = self.derive_session_key(peer_node_id, peer_public_key_pem)
+
+            # Extrahiere IV, Tag und Ciphertext
+            iv = encrypted[:12]
+            tag = encrypted[12:28]
+            ciphertext = encrypted[28:]
+
+            # AES-256-GCM Cipher
+            cipher = Cipher(
+                algorithms.AES(session_key),
+                modes.GCM(iv, tag),
+                backend=default_backend()
+            )
+            decryptor = cipher.decryptor()
+
+            plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+            return plaintext
+        except Exception as e:
+            logger.error(f"Entschlüsselung fehlgeschlagen: {e}")
+            raise
+
 
 class MessageLogger:
     """Logging aller Nachrichten"""
@@ -213,12 +269,12 @@ class MessageLogger:
         try:
             log_entry = {
                 'timestamp': datetime.now().isoformat(),
-                'direction': direction,  # 'sent' oder 'received'
+                'direction': direction,
                 'topic': topic,
                 'source_node_id': source_node_id,
                 'payload_size': len(payload),
                 'payload_hash': hashlib.sha256(payload).hexdigest(),
-                'signature': signature[:32] + '...',  # Gekürzte Signatur
+                'signature': signature[:32] + '...',
                 'verified': verified
             }
 
@@ -327,33 +383,25 @@ class MessageHandler:
 
     def __init__(self, node):
         self.node = node
+        self.subscribers: Dict[str, Set[str]] = {}  # topic -> set of node_ids
 
     async def handle_stream(self, stream):
-        """Stream von anderem Node bearbeiten"""
-        peer_id = stream.muxed_conn.peer_id
-        logger.info(f"Stream empfangen von {peer_id}")
-
+        """Stream-Handler (wird implementiert wenn libp2p verwendet wird)"""
+        logger.info("Stream empfangen")
         try:
             while True:
                 try:
                     data = await asyncio.wait_for(stream.read(4096), timeout=10.0)
                     if not data:
                         break
-                    await self._process_message(data, peer_id)
+                    await self._process_message(data)
                 except asyncio.TimeoutError:
                     continue
-        except StreamEOF:
-            logger.info(f"Stream geschlossen von {peer_id}")
         except Exception as e:
             logger.error(f"Fehler beim Lesen vom Stream: {e}")
-        finally:
-            try:
-                await stream.close()
-            except:
-                pass
 
-    async def _process_message(self, data: bytes, peer_id: ID):
-        """Nachricht verarbeiten: [type:1][node_id_len:2][node_id:var][sig_len:4][sig:var][payload:var]"""
+    async def _process_message(self, data: bytes):
+        """Nachricht verarbeiten (entschlüsseln und validieren)"""
         try:
             if len(data) < 7:
                 return
@@ -374,14 +422,45 @@ class MessageHandler:
             signature = data[offset:offset + sig_len]
             offset += sig_len
 
-            payload = data[offset:]
+            encrypted_payload = data[offset:]
 
-            if msg_type == 1:  # Registry Update
+            # Peer Info abrufen
+            peer = self.node.config.get_peer(node_id)
+            if not peer:
+                # Peer Auth Requests sind nicht verschlüsselt
+                if msg_type == 4:
+                    await self._handle_peer_auth(encrypted_payload, node_id)
+                else:
+                    logger.warning(f"Unbekannter Node: {node_id}")
+                return
+
+            # Entschlüsseln (außer Peer Auth)
+            if msg_type == 4:
+                payload = encrypted_payload
+            else:
+                try:
+                    payload = self.node.crypto.decrypt_message(
+                        node_id,
+                        peer['public_key'],
+                        encrypted_payload
+                    )
+                except Exception as e:
+                    logger.error(f"Fehler beim Entschlüsseln von {node_id}: {e}")
+                    return
+
+            # Signatur verifizieren
+            if not self.node.crypto.verify_signature(peer['public_key'], payload, signature):
+                logger.error(f"Signatur ungültig für Message von {node_id}")
+                return
+
+            if msg_type == 1:
                 await self._handle_registry_update(payload, node_id, signature)
-            elif msg_type == 2:  # Topic Message
+            elif msg_type == 2:
                 await self._handle_topic_message(payload, node_id, signature)
-            elif msg_type == 3:  # Peer Auth Request
-                await self._handle_peer_auth(payload, node_id, peer_id)
+            elif msg_type == 3:
+                await self._handle_subscription(payload, node_id, signature)
+            elif msg_type == 4:
+                await self._handle_peer_auth(payload, node_id)
         except Exception as e:
             logger.error(f"Fehler beim Verarbeiten der Nachricht: {e}")
 
@@ -417,7 +496,6 @@ class MessageHandler:
                 logger.error(f"Signatur ungültig für Message von {node_id}")
                 return
 
-            # Format: [topic_len:2][topic:var][data:var]
             topic_len = struct.unpack('>H', payload[:2])[0]
             topic = payload[2:2 + topic_len].decode('utf-8')
             message_data = payload[2 + topic_len:]
@@ -431,7 +509,29 @@ class MessageHandler:
         except Exception as e:
             logger.error(f"Fehler beim Topic Message: {e}")
 
-    async def _handle_peer_auth(self, payload: bytes, node_id: str, peer_id: ID):
+    async def _handle_subscription(self, payload: bytes, node_id: str, signature: bytes):
+        """Subscription Request von Remote Node"""
+        try:
+            msg = json.loads(payload.decode('utf-8'))
+            topic = msg.get('topic')
+            action = msg.get('action')
+
+            if action == 'subscribe':
+                if topic not in self.subscribers:
+                    self.subscribers[topic] = set()
+                self.subscribers[topic].add(node_id)
+                logger.info(f"Node {node_id[:8]}... hat sich auf {topic} subscribiert")
+                logger.debug(f"Aktuelle Subscriber für {topic}: {len(self.subscribers.get(topic, set()))}")
+
+            elif action == 'unsubscribe':
+                if topic in self.subscribers:
+                    self.subscribers[topic].discard(node_id)
+                    logger.info(f"Node {node_id[:8]}... hat sich von {topic} abgemeldet")
+
+        except Exception as e:
+            logger.error(f"Fehler beim Subscription Handler: {e}")
+
+    async def _handle_peer_auth(self, payload: bytes, node_id: str):
         """Neue Node-Authentifizierungsanfrage"""
         try:
             msg = json.loads(payload.decode('utf-8'))
@@ -442,13 +542,11 @@ class MessageHandler:
             logger.warning(f"Neue Node Authentifizierungsanfrage:")
             logger.warning(f"  Node ID: {new_node_id}")
             logger.warning(f"  Public Key: {public_key[:50]}...")
-            logger.warning(f"  Peer Info: {peer_info}")
 
-            # Benutzer fragen
             response = await self._prompt_user_auth(new_node_id, public_key)
 
             if response:
-                self.node.config.add_peer(new_node_id, str(peer_id), public_key)
+                self.node.config.add_peer(new_node_id, str(new_node_id), public_key)
                 logger.info(f"Node {new_node_id} authentifiziert und hinzugefügt")
             else:
                 logger.warning(f"Node {new_node_id} abgelehnt")
@@ -471,8 +569,288 @@ class MessageHandler:
         return await loop.run_in_executor(None, ask)
 
 
+class DiscoveryService:
+    """UDP Multicast Discovery Service"""
+
+    def __init__(self, node, discovery_port: int = 5353):
+        self.node = node
+        self.discovery_port = discovery_port
+        self.multicast_group = ('224.0.0.1', 5353)
+        self.discovery_sock = None
+        self.known_nodes: Dict[str, dict] = {}
+
+    async def start(self):
+        """Discovery Service starten"""
+        self.discovery_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        try:
+            self.discovery_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            self.discovery_sock.bind(('', self.discovery_port))
+
+            mreq = socket.inet_aton('224.0.0.1') + socket.inet_aton('0.0.0.0')
+            self.discovery_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError as e:
+            logger.warning(f"Multicast nicht verfügbar: {e}. Nutze Unicast stattdessen.")
+
+        self.discovery_sock.setblocking(False)
+
+        asyncio.create_task(self._listen_for_discoveries())
+        asyncio.create_task(self._announce_self())
+        logger.info("Discovery Service gestartet")
+
+    async def _announce_self(self):
+        """Eigenen Node periodisch ankündigen"""
+        while True:
+            await asyncio.sleep(5)
+
+            try:
+                announcement = {
+                    'type': 'announce',
+                    'node_id': self.node.node_id,
+                    'port': self.node.port,
+                    'topics': list(self.node.provided_topics),
+                    'timestamp': datetime.now().timestamp(),
+                    'public_key': self.node.crypto.get_public_key_pem()
+                }
+
+                msg = json.dumps(announcement).encode('utf-8')
+                signature = self.node.crypto.sign_message(msg)
+
+                # Multicast Announcement
+                try:
+                    payload = struct.pack('>I', len(signature)) + signature + msg
+                    self.discovery_sock.sendto(payload, self.multicast_group)
+                except:
+                    pass
+
+                # Unicast an bekannte Nodes
+                for node_info in self.known_nodes.values():
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        sock.sendto(payload, (node_info['ip'], node_info['port']))
+                        sock.close()
+                    except:
+                        pass
+
+                logger.debug(f"Ankündigung gesendet: {len(self.node.provided_topics)} Topics")
+
+            except Exception as e:
+                logger.error(f"Fehler bei Ankündigung: {e}")
+
+    async def _listen_for_discoveries(self):
+        """Auf Node Ankündigungen lauschen"""
+        loop = asyncio.get_event_loop()
+
+        while True:
+            try:
+                data, addr = await loop.sock_recvfrom(self.discovery_sock, 4096)
+                await self._process_discovery(data, addr)
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Discovery Fehler: {e}")
+                await asyncio.sleep(0.1)
+
+    async def _process_discovery(self, data: bytes, addr):
+        """Discovery Nachricht verarbeiten"""
+        try:
+            if len(data) < 4:
+                return
+
+            sig_len = struct.unpack('>I', data[:4])[0]
+            if len(data) < 4 + sig_len:
+                return
+
+            signature = data[4:4 + sig_len]
+            msg_data = data[4 + sig_len:]
+
+            msg = json.loads(msg_data.decode('utf-8'))
+            node_id = msg.get('node_id')
+
+            if node_id == self.node.node_id:
+                return  # Ignoriere eigene Ankündigungen
+
+            # Signatur verifizieren
+            public_key_pem = msg.get('public_key')
+            if not self.node.crypto.verify_signature(public_key_pem, msg_data, signature):
+                logger.warning(f"Ungültige Signatur von {node_id}")
+                return
+
+            # Node speichern
+            self.known_nodes[node_id] = {
+                'node_id': node_id,
+                'ip': addr[0],
+                'port': msg.get('port'),
+                'topics': msg.get('topics', []),
+                'last_seen': msg.get('timestamp'),
+                'public_key': public_key_pem
+            }
+
+            logger.info(f"Node entdeckt: {node_id[:8]}... mit {len(msg.get('topics', []))} Topics")
+
+            # Topics in Registry eintragen
+            for topic in msg.get('topics', []):
+                await self.node.registry.register_topic(topic, node_id, node_id)
+
+            # Pending Topics prüfen
+            await self.node._check_pending_topics()
+
+        except Exception as e:
+            logger.error(f"Fehler beim Discovery Processing: {e}")
+
+
+class NodeConnectionPool:
+    """Verwaltet Verbindungen zu anderen Nodes"""
+
+    def __init__(self, node):
+        self.node = node
+        self.connections: Dict[str, 'NodeConnection'] = {}
+        self.lock = asyncio.Lock()
+
+    async def get_or_create_connection(self, node_id: str, node_info: dict) -> 'NodeConnection':
+        """Verbindung zu Node erstellen oder wiederverwenden"""
+        async with self.lock:
+            if node_id not in self.connections:
+                conn = NodeConnection(self.node, node_id, node_info)
+                self.connections[node_id] = conn
+                await conn.connect()
+            return self.connections[node_id]
+
+    async def send_to_node(self, node_id: str, msg_type: int, payload: bytes, node_info: dict):
+        """Nachricht zu Node senden"""
+        try:
+            conn = await self.get_or_create_connection(node_id, node_info)
+            await conn.send_message(msg_type, payload)
+        except Exception as e:
+            logger.error(f"Fehler beim Senden an {node_id}: {e}")
+
+
+class NodeConnection:
+    """Verbindung zu einem anderen Node"""
+
+    def __init__(self, node, peer_node_id: str, peer_info: dict):
+        self.node = node
+        self.peer_node_id = peer_node_id
+        self.peer_info = peer_info
+        self.reader = None
+        self.writer = None
+
+    async def connect(self):
+        """Zu Remote Node verbinden"""
+        try:
+            ip = self.peer_info.get('ip')
+            port = self.peer_info.get('port', 10000)
+
+            self.reader, self.writer = await asyncio.open_connection(ip, port)
+            logger.info(f"Verbunden mit Node {self.peer_node_id[:8]}... auf {ip}:{port}")
+
+            asyncio.create_task(self._listen())
+        except Exception as e:
+            logger.error(f"Fehler beim Verbinden zu {self.peer_node_id}: {e}")
+
+    async def send_message(self, msg_type: int, payload: bytes):
+        """Nachricht senden (verschlüsselt)"""
+        if not self.writer:
+            await self.connect()
+
+        try:
+            # Nachricht signieren
+            signature = self.node.crypto.sign_message(payload)
+            node_id_bytes = self.node.node_id.encode('utf-8')
+
+            # Unverschlüsseltes Format für Signatur
+            plain_msg = (struct.pack('>B', msg_type) +
+                         struct.pack('>H', len(node_id_bytes)) + node_id_bytes +
+                         struct.pack('>I', len(signature)) + signature +
+                         payload)
+
+            # Peer Public Key abrufen
+            peer_info = self.node.config.get_peer(self.peer_node_id)
+            if not peer_info:
+                logger.warning(f"Peer {self.peer_node_id} nicht konfiguriert")
+                return
+
+            peer_public_key = peer_info['public_key']
+
+            # Verschlüsseln (außer msg_type, node_id und Signatur)
+            payload_to_encrypt = payload
+            encrypted_payload = self.node.crypto.encrypt_message(
+                self.peer_node_id,
+                peer_public_key,
+                payload_to_encrypt
+            )
+
+            # Finales Format: [unencrypted_header][encrypted_payload]
+            encrypted_msg = (struct.pack('>B', msg_type) +
+                             struct.pack('>H', len(node_id_bytes)) + node_id_bytes +
+                             struct.pack('>I', len(signature)) + signature +
+                             encrypted_payload)
+
+            self.writer.write(encrypted_msg)
+            await self.writer.drain()
+
+            logger.debug(f"Verschlüsselte Nachricht an {self.peer_node_id[:8]}... gesendet")
+        except Exception as e:
+            logger.error(f"Fehler beim Nachrichtensenden: {e}")
+            self.writer = None
+
+    async def _listen(self):
+        """Auf Nachrichten von Remote Node lauschen"""
+        try:
+            while True:
+                data = await self.reader.readexactly(4096)
+                if not data:
+                    break
+                await self.node.message_handler._process_message(data)
+        except asyncio.IncompleteReadError:
+            pass
+        except Exception as e:
+            logger.debug(f"Connection zu {self.peer_node_id} geschlossen: {e}")
+
+
+class NetworkServer:
+    """TCP Server für eingehende Verbindungen"""
+
+    def __init__(self, node, port: int = 10000):
+        self.node = node
+        self.port = port
+        self.server = None
+
+    async def start(self):
+        """Server starten"""
+        try:
+            self.server = await asyncio.start_server(
+                self._handle_client,
+                '0.0.0.0',
+                self.port
+            )
+
+            async with self.server:
+                logger.info(f"Network Server auf Port {self.port} gestartet")
+                await self.server.serve_forever()
+        except Exception as e:
+            logger.error(f"Fehler beim Starten des Network Servers: {e}")
+
+    async def _handle_client(self, reader, writer):
+        """Eingehende Client-Verbindung bearbeiten"""
+        try:
+            while True:
+                data = await reader.readexactly(4096)
+                if not data:
+                    break
+                await self.node.message_handler._process_message(data)
+        except asyncio.IncompleteReadError:
+            pass
+        except Exception as e:
+            logger.debug(f"Client Fehler: {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
 class PubSubNode:
-    """Hauptknoten mit libp2p und DHT"""
+    """Hauptknoten mit Publish-Subscribe Funktionalität"""
 
     def __init__(self, port: int = 10000, local_port: int = 9000,
                  config_path: str = "config.json"):
@@ -484,11 +862,11 @@ class PubSubNode:
         self.crypto = CryptoManager(self.config)
         self.message_logger = MessageLogger()
 
-        self.host: Optional[BasicHost] = None
-        self.pubsub: Optional[Pubsub] = None
-        self.dht = None
         self.registry = DistributedTopicRegistry()
         self.local_interface = LocalInterface(self, local_port)
+        self.discovery_service = DiscoveryService(self)
+        self.connection_pool = NodeConnectionPool(self)
+        self.network_server = NetworkServer(self, port)
 
         self.provided_topics: Set[str] = set()
         self.subscribed_topics: Set[str] = set()
@@ -498,7 +876,6 @@ class PubSubNode:
         self.pending_topics: Set[str] = set()
 
         self.message_handler = MessageHandler(self)
-        self.peer_connections: Dict[str, any] = {}
         self.reconnect_attempts: Dict[str, int] = {}
         self.max_reconnect_attempts = 5
 
@@ -507,47 +884,20 @@ class PubSubNode:
     async def start(self):
         """Node starten und initialisieren"""
         try:
-            logger.info("Starte libp2p Node mit DHT...")
+            logger.info("Starte PubSub Node...")
 
-            private_key = create_new_private_key("secp256k1")
+            # Network Server starten
+            asyncio.create_task(self.network_server.start())
 
-            self.host = BasicHost(
-                private_key=private_key,
-                transports=[QuicTransport(), TCPTransport()],
-                muxers=[],
-                security_options=[],
-                peerstore=None
-            )
+            # Discovery Service starten
+            await self.discovery_service.start()
 
-            await self.host.get_ready()
-
-            self.pubsub = Pubsub(
-                host=self.host,
-                router=GossipSub(protocols=["/meshsub/1.0.0"])
-            )
-            await self.pubsub.wait_until_ready()
-
-            quic_addr = Multiaddr(f"/ip4/127.0.0.1/udp/{self.port}/quic")
-            tcp_addr = Multiaddr(f"/ip4/127.0.0.1/tcp/{self.port + 1000}")
-
-            await self.host.listen(quic_addr)
-            await self.host.listen(tcp_addr)
-
-            peer_id = self.host.get_id()
-            logger.info(f"Peer ID: {peer_id}")
-            logger.info(f"Listening auf:")
-            for addr in self.host.get_addrs():
-                logger.info(f"  {addr}")
-
-            self.host.set_stream_handler(TOPIC_REGISTRY_PROTOCOL, self.message_handler.handle_stream)
-            self.host.set_stream_handler(MESSAGE_PROTOCOL, self.message_handler.handle_stream)
-            self.host.set_stream_handler(PEER_AUTH_PROTOCOL, self.message_handler.handle_stream)
-
+            # Lokale Schnittstelle starten
             await self.local_interface.start()
 
+            # Background Tasks
             asyncio.create_task(self._periodic_topic_search())
-            asyncio.create_task(self._periodic_registry_broadcast())
-            asyncio.create_task(self._periodic_reconnect())
+            asyncio.create_task(self._distribute_topics())
 
             logger.info("Node vollständig initialisiert")
 
@@ -558,45 +908,54 @@ class PubSubNode:
     async def provide_topic(self, topic: str):
         """Topic anbieten"""
         if topic in self.provided_topics:
+            logger.warning(f"Topic {topic} wird bereits angeboten")
             return
 
         self.provided_topics.add(topic)
-        peer_id = str(self.host.get_id())
-        await self.registry.register_topic(topic, peer_id, self.node_id)
+        await self.registry.register_topic(topic, self.node_id, self.node_id)
 
-        self.pubsub.subscribe(topic, callback=self._pubsub_message_handler)
+        # An alle bekannten Nodes verteilen
+        await self._distribute_topic(topic)
+
         logger.info(f"Biete Topic an: {topic}")
 
     async def subscribe(self, topic: str, callback: Callable = None):
-        """Auf Topic subscriben"""
-        if topic in self.subscribed_topics:
-            if callback:
-                if topic not in self.message_callbacks:
-                    self.message_callbacks[topic] = []
-                self.message_callbacks[topic].append(callback)
-            return
-
-        provider = await self.registry.get_provider(topic)
-
-        if provider is None:
-            logger.info(f"Kein Provider für {topic}. Werde periodisch suchen.")
-            self.pending_topics.add(topic)
-        else:
-            await self._do_subscribe(topic, provider[0], provider[1])
-
+        """Auf Topic subscriben (lokal oder remote)"""
+        # Callback registrieren (von lokalem Programm)
         if callback:
             if topic not in self.message_callbacks:
                 self.message_callbacks[topic] = []
             self.message_callbacks[topic].append(callback)
 
-    async def _do_subscribe(self, topic: str, provider_peer_id: str, provider_node_id: str):
-        """Auf Topic subscriben"""
+        # Wenn bereits subscribiert, fertig
+        if topic in self.subscribed_topics:
+            return
+
+        # Prüfe ob Topic lokal angeboten wird
+        if topic in self.provided_topics:
+            logger.info(f"Topic {topic} wird lokal angeboten")
+            self.subscribed_topics.add(topic)
+            return
+
+        # Suche nach Remote Provider
+        provider = await self.registry.get_provider(topic)
+
+        if provider is None:
+            logger.info(f"Kein Provider für {topic} gefunden. Werde periodisch suchen.")
+            self.pending_topics.add(topic)
+        else:
+            await self._do_subscribe(topic, provider[1])
+
+    async def _do_subscribe(self, topic: str, provider_node_id: str):
+        """Remote Topic subscriben (nur wenn lokal jemand abonniert hat)"""
         if topic in self.subscribed_topics:
             return
 
         self.subscribed_topics.add(topic)
-        self.pubsub.subscribe(topic, callback=self._pubsub_message_handler)
-        logger.info(f"Subscribiert auf {topic} vom Node {provider_node_id}")
+        logger.info(f"Subscribiert auf Remote-Topic {topic} vom Node {provider_node_id[:8]}...")
+
+        # Benachrichtige Remote Node dass wir subscribiert haben
+        await self._notify_subscription(topic, provider_node_id)
 
     async def publish(self, topic: str, payload: bytes):
         """Nachricht publishen"""
@@ -605,31 +964,22 @@ class PubSubNode:
             return
 
         try:
-            # Nachricht mit Signatur versenden
-            node_id_bytes = self.node_id.encode('utf-8')
             signature = self.crypto.sign_message(payload)
 
             # Format: [topic_len:2][topic:var][payload:var]
             msg_data = struct.pack('>H', len(topic)) + topic.encode() + payload
-
-            await self.pubsub.publish(topic, msg_data)
 
             await self.message_logger.log_message(
                 'sent', topic, self.node_id, payload,
                 signature.hex()[:64], True
             )
 
+            # An alle Subscriber verteilen
+            await self._distribute_message(topic, msg_data)
+
             logger.info(f"Publishe auf {topic}: {len(payload)} bytes")
         except Exception as e:
             logger.error(f"Fehler beim Publishen: {e}")
-
-    def _pubsub_message_handler(self, message):
-        """PubSub-Nachricht empfangen"""
-        try:
-            topic = message.topicIDs[0] if message.topicIDs else "unknown"
-            asyncio.create_task(self._deliver_message(topic, message.data))
-        except Exception as e:
-            logger.error(f"Fehler im PubSub Handler: {e}")
 
     async def _deliver_message(self, topic: str, payload: bytes):
         """Nachricht an Callbacks delivern"""
@@ -640,67 +990,69 @@ class PubSubNode:
                 except Exception as e:
                     logger.error(f"Fehler in Callback für {topic}: {e}")
 
-    async def _periodic_registry_broadcast(self):
-        """Registry periodisch broadcasten"""
+    async def _distribute_topic(self, topic: str):
+        """Topic an alle bekannten Nodes verteilen"""
+        payload = json.dumps({
+            'topic': topic,
+            'node_id': self.node_id,
+            'port': self.port
+        }).encode('utf-8')
+
+        for node_id, node_info in self.discovery_service.known_nodes.items():
+            try:
+                await self.connection_pool.send_to_node(node_id, 1, payload, node_info)
+            except:
+                pass
+
+    async def _distribute_message(self, topic: str, msg_data: bytes):
+        """Nachricht an alle Subscriber verteilen"""
+        for node_id, node_info in self.discovery_service.known_nodes.items():
+            try:
+                await self.connection_pool.send_to_node(node_id, 2, msg_data, node_info)
+            except:
+                pass
+
+    async def _notify_subscription(self, topic: str, provider_node_id: str):
+        """Benachrichtige Provider Node dass wir subscribiert haben"""
+        payload = json.dumps({
+            'topic': topic,
+            'node_id': self.node_id,
+            'port': self.port,
+            'action': 'subscribe'
+        }).encode('utf-8')
+
+        if provider_node_id in self.discovery_service.known_nodes:
+            node_info = self.discovery_service.known_nodes[provider_node_id]
+            try:
+                await self.connection_pool.send_to_node(provider_node_id, 3, payload, node_info)
+                logger.info(f"Subscription Benachrichtigung an {provider_node_id[:8]}... gesendet")
+            except Exception as e:
+                logger.error(f"Fehler beim Senden der Subscription: {e}")
+
+    async def _distribute_topics(self):
+        """Periodisch Topics an Netzwerk verteilen"""
         while True:
             await asyncio.sleep(10)
 
-            try:
-                if not self.provided_topics:
-                    continue
+            for topic in self.provided_topics:
+                await self._distribute_topic(topic)
 
-                peer_id = str(self.host.get_id())
+    async def _check_pending_topics(self):
+        """Prüfe ob Pending Topics jetzt verfügbar sind"""
+        topics_to_remove = set()
+        for topic in self.pending_topics:
+            provider = await self.registry.get_provider(topic)
+            if provider:
+                await self._do_subscribe(topic, provider[1])
+                topics_to_remove.add(topic)
 
-                for topic in self.provided_topics:
-                    msg = {
-                        'topic': topic,
-                        'peer_id': peer_id,
-                        'node_id': self.node_id
-                    }
-                    payload = json.dumps(msg).encode('utf-8')
-                    signature = self.crypto.sign_message(payload)
-
-                    # Mit allen Peers über Stream kommunizieren
-                    for peer in list(self.host.get_network().connections):
-                        asyncio.create_task(self._send_registry_update(
-                            peer.remote_peer, payload, signature
-                        ))
-            except Exception as e:
-                logger.error(f"Fehler in Registry Broadcast: {e}")
-
-    async def _send_registry_update(self, peer_id: ID, payload: bytes, signature: bytes):
-        """Registry Update zu Peer senden"""
-        try:
-            stream = await self.host.new_stream(peer_id, [TOPIC_REGISTRY_PROTOCOL])
-
-            node_id_bytes = self.node_id.encode('utf-8')
-            msg_type = 1
-            data = (struct.pack('>B', msg_type) +
-                    struct.pack('>H', len(node_id_bytes)) + node_id_bytes +
-                    struct.pack('>I', len(signature)) + signature +
-                    payload)
-
-            await stream.write(data)
-            await stream.close()
-        except Exception as e:
-            logger.debug(f"Fehler beim Registry Update zu Peer: {e}")
+        self.pending_topics -= topics_to_remove
 
     async def _periodic_topic_search(self):
-        """Periodisch nach Topics suchen"""
+        """Periodisch nach neuen Providern suchen"""
         while True:
             await asyncio.sleep(self.topic_search_interval)
-
-            if not self.pending_topics:
-                continue
-
-            topics_to_remove = set()
-            for topic in self.pending_topics:
-                provider = await self.registry.get_provider(topic)
-                if provider:
-                    await self._do_subscribe(topic, provider[0], provider[1])
-                    topics_to_remove.add(topic)
-
-            self.pending_topics -= topics_to_remove
+            await self._check_pending_topics()
 
     async def _periodic_reconnect(self):
         """Periodisch Reconnect versuchen"""
@@ -709,57 +1061,34 @@ class PubSubNode:
 
             try:
                 for node_id, peer_info in self.config.get_all_peers().items():
-                    if node_id not in self.peer_connections:
+                    if node_id not in self.reconnect_attempts:
                         self.reconnect_attempts[node_id] = 0
 
                     if self.reconnect_attempts.get(node_id, 0) < self.max_reconnect_attempts:
-                        asyncio.create_task(self._try_connect_peer(node_id, peer_info))
+                        logger.debug(f"Versuche Reconnect zu Node {node_id}")
             except Exception as e:
                 logger.error(f"Fehler in Reconnect: {e}")
 
-    async def _try_connect_peer(self, node_id: str, peer_info: dict):
-        """Versuchen zu Peer zu verbinden"""
-        try:
-            # Hier würde die echte Verbindung stattfinden
-            logger.debug(f"Versuche Verbindung zu Node {node_id}")
-        except Exception as e:
-            attempt = self.reconnect_attempts.get(node_id, 0) + 1
-            self.reconnect_attempts[node_id] = attempt
-            logger.debug(f"Reconnect Versuch {attempt} für Node {node_id} fehlgeschlagen: {e}")
+    @property
+    def peer_connections(self):
+        """Kompatibilität"""
+        return {}
 
 
 async def main():
-    """Beispiel: Zwei Nodes mit Authentifizierung"""
+    """Beispiel: Node starten"""
 
-    # Node 1 starten
     node1 = PubSubNode(port=10000, local_port=9000, config_path="config_node1.json")
     await node1.start()
     await node1.provide_topic("sensor_data")
 
     logger.info(f"Node 1 gestartet - ID: {node1.node_id}")
-    logger.info(f"Public Key von Node 1:\n{node1.crypto.get_public_key_pem()}")
 
-    # Node 2 starten
-    node2 = PubSubNode(port=10001, local_port=9001, config_path="config_node2.json")
-    await node2.start()
-
-    logger.info(f"Node 2 gestartet - ID: {node2.node_id}")
-    logger.info(f"Public Key von Node 2:\n{node2.crypto.get_public_key_pem()}")
-
-    # Node 2 subscribes auf Topic von Node 1
-    async def message_callback(topic: str, payload: bytes):
-        logger.info(f"Node2 empfangen auf {topic}: {payload[:50]}")
-
-    await node2.subscribe("sensor_data", callback=message_callback)
-
-    await asyncio.sleep(2)
-
-    # Nachrichten publishen
-    for i in range(3):
-        await node1.publish("sensor_data", f"Sensor Wert {i}".encode())
-        await asyncio.sleep(1)
-
-    await asyncio.sleep(5)
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutdown...")
 
 
 if __name__ == "__main__":
